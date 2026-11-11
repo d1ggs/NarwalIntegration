@@ -97,6 +97,25 @@ v1.0.8's per-room profiles create six selects and a switch **per room** — 168 
 - Wake system for sleeping robots + keepalive heartbeat
 - 60-second polling fallback
 
+### Raw commands
+
+`vacuum.send_command` takes the topic without the product key and device ID, and the request
+body as hex. The robot's reply is fired as a `narwal_command_response` event
+(`command`, `result_code`, `accepted`, `response_hex`); a refused command raises an error.
+
+```yaml
+action: vacuum.send_command
+target:
+  entity_id: vacuum.narwal_freo_20_vacuum
+data:
+  command: config/set
+  params:
+    payload_hex: "a00200"   # SetConfig field 36 speechControlEnabled = false (Freo 20)
+```
+
+Field numbers differ between models and firmware: read the current values first
+(`command: config/get`, then watch the event) and change one field at a time.
+
 ## Installation
 
 ### HACS (Recommended)
