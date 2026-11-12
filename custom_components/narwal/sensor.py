@@ -21,8 +21,13 @@ from .coordinator import NarwalCoordinator
 from .entity import NarwalDockEntity, NarwalEntity
 from .narwal_client import NarwalState
 
-# Product keys for models without an auto-detergent tank.
-_NO_DETERGENT_KEYS = product_keys_for_model("Narwal Flow") | product_keys_for_model("Narwal Flow 2")
+# Product keys for models without an auto-detergent tank. The Freo 20 has none
+# either and reports a constant 100 in field 41 (fw v01.00.21.05 and v01.00.36.11).
+_NO_DETERGENT_KEYS = (
+    product_keys_for_model("Narwal Flow")
+    | product_keys_for_model("Narwal Flow 2")
+    | product_keys_for_model("Narwal Freo 20")
+)
 
 
 @dataclass(frozen=True, kw_only=True)

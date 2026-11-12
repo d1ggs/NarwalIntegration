@@ -78,13 +78,14 @@ def test_cleaning_metrics_are_available_during_active_clean() -> None:
         (NARWAL_MODELS["Narwal Flow 2"], False),
         ("iSuVlI1If2", False),  # Flow 2 alias key (#81)
         ("mkbqaprvrb", False),  # Flow 2 alias key (#81)
+        (NARWAL_MODELS["Narwal Freo 20"], False),
         (NARWAL_MODELS["Narwal Freo Z10 Ultra"], True),
     ],
 )
 async def test_detergent_sensor_disabled_by_default_without_detergent_tank(
     product_key: str, enabled_by_default: bool
 ) -> None:
-    """Flow models have no detergent tank, so field 41 is created but disabled."""
+    """Flow models and the Freo 20 have no detergent tank, so field 41 is created but disabled."""
     state = NarwalState()
     coordinator = _sensor("battery", state).coordinator
     entry = MagicMock()
