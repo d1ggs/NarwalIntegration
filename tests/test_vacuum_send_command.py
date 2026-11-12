@@ -56,14 +56,14 @@ class TestDispatch:
         vac = _vacuum()
         await vac.async_send_command("config/set", {"payload_hex": "a00200"})
         vac.coordinator.client.send_command.assert_awaited_once_with(
-            "config/set", bytes.fromhex("a00200"), timeout=10.0
+            "config/set", bytes.fromhex("a00200"), timeout=5.0
         )
 
     async def test_strips_slashes_and_defaults_to_empty_payload(self) -> None:
         vac = _vacuum()
         await vac.async_send_command("/region/get/")
         vac.coordinator.client.send_command.assert_awaited_once_with(
-            "region/get", b"", timeout=10.0
+            "region/get", b"", timeout=5.0
         )
 
     async def test_custom_timeout(self) -> None:
@@ -85,6 +85,24 @@ class TestDispatch:
             },
         )
 
+    async def test_holds_the_action_lock_while_sending(self) -> None:
+        vac = _vacuum()
+        lock = vac.coordinator.dock_action_lock
+
+        async def _send(*_args, **_kwargs):
+            assert lock.locked()
+            return CommandResponse(result_code=CommandResult.SUCCESS)
+
+        vac.coordinator.client.send_command = AsyncMock(side_effect=_send)
+        await vac.async_send_command("region/get")
+        assert not lock.locked()
+
+    async def test_get_topic_reply_is_not_a_refusal(self) -> None:
+        """Field 1 of a read reply can be data that looks like a result code."""
+        vac = _vacuum(CommandResponse(result_code=7, raw_payload=b"\x08\x07"))
+        await vac.async_send_command("common/get_feature_list")
+        assert vac.hass.bus.async_fire.call_args.args[1]["response_hex"] == "0807"
+
     async def test_wakes_a_sleeping_robot_first(self) -> None:
         vac = _vacuum()
         vac.coordinator.client.robot_awake = False
@@ -104,6 +122,13 @@ class TestRejections:
             await vac.async_send_command(topic)
         vac.coordinator.client.send_command.assert_not_awaited()
 
+    async def test_never_answered_topic_is_refused(self) -> None:
+        """An unanswered request would hold its reply slot and starve the next ones."""
+        vac = _vacuum()
+        with pytest.raises(_HomeAssistantError):
+            await vac.async_send_command("status/app_status_heartbeat")
+        vac.coordinator.client.send_command.assert_not_awaited()
+
     @pytest.mark.parametrize(
         "params",
         [
@@ -113,7 +138,8 @@ class TestRejections:
             {"payload_hex": "a0020"},
             {"timeout": "soon"},
             {"timeout": 0},
-            {"timeout": 120},
+            {"timeout": 45},
+            {"payload_hex": 100},
         ],
     )
     async def test_invalid_params(self, params) -> None:
@@ -137,3 +163,12 @@ class TestRejections:
         with pytest.raises(_HomeAssistantError):
             await vac.async_send_command("region/get")
         vac.hass.bus.async_fire.assert_not_called()
+
+    async def test_wake_failure_becomes_service_error(self) -> None:
+        vac = _vacuum()
+        vac.coordinator.client.robot_awake = False
+        error = sys.modules[type(vac).__module__].NarwalConnectionError
+        vac.coordinator.client.wake = AsyncMock(side_effect=error("gone"))
+        with pytest.raises(_HomeAssistantError):
+            await vac.async_send_command("region/get")
+        vac.coordinator.client.send_command.assert_not_awaited()

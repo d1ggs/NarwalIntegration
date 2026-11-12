@@ -54,16 +54,16 @@ from .narwal_client import (
 )
 from .narwal_client.const import (
     ACTIVE_CLEANING_STATUSES,
+    COMMAND_RESPONSE_TIMEOUT,
+    UNACKNOWLEDGED_TOPICS,
     fan_level_for_live_command,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# vacuum.send_command: a short topic such as ``config/set`` (no product key or
-# device ID), its protobuf body as hex, and an optional reply timeout.
 _SEND_COMMAND_TOPIC = re.compile(r"[a-z0-9_]+(?:/[a-z0-9_]+)*")
 _SEND_COMMAND_PARAMS = frozenset({"payload_hex", "timeout"})
-_SEND_COMMAND_TIMEOUT_RANGE = (1.0, 60.0)
+_SEND_COMMAND_TIMEOUT_RANGE = (1.0, 30.0)
 EVENT_COMMAND_RESPONSE = "narwal_command_response"
 
 
@@ -667,11 +667,18 @@ class NarwalVacuum(NarwalEntity, RestoreEntity, StateVacuumEntity):
         without the product key and device ID. ``params`` may hold
         ``payload_hex`` (the protobuf request body, empty by default) and
         ``timeout`` in seconds. The reply is published as a
-        ``narwal_command_response`` event; a refused command raises.
+        ``narwal_command_response`` event. A refused command raises, except
+        for ``get`` topics, whose field 1 can be data rather than a result.
         """
         topic = (command or "").strip().strip("/")
         if not _SEND_COMMAND_TOPIC.fullmatch(topic):
             raise HomeAssistantError(f"Narwal send_command: invalid topic {command!r}")
+        if topic in UNACKNOWLEDGED_TOPICS:
+            # Responses are matched by send order; an unanswered request would
+            # make the next commands time out until its slot expires (#108).
+            raise HomeAssistantError(
+                f"Narwal send_command: {topic} is never answered by the robot"
+            )
         if params is None:
             params = {}
         if not isinstance(params, dict):
@@ -683,15 +690,20 @@ class NarwalVacuum(NarwalEntity, RestoreEntity, StateVacuumEntity):
             raise HomeAssistantError(
                 f"Narwal send_command: unknown params {', '.join(unknown)}"
             )
+        payload_hex = params.get("payload_hex", "")
+        if not isinstance(payload_hex, str):
+            raise HomeAssistantError(
+                "Narwal send_command: payload_hex must be a quoted hex string"
+            )
         try:
-            payload = bytes.fromhex(str(params.get("payload_hex") or ""))
+            payload = bytes.fromhex(payload_hex)
         except ValueError as err:
             raise HomeAssistantError(
                 "Narwal send_command: payload_hex is not valid hex"
             ) from err
         low, high = _SEND_COMMAND_TIMEOUT_RANGE
         try:
-            timeout = float(params.get("timeout", 10.0))
+            timeout = float(params.get("timeout", COMMAND_RESPONSE_TIMEOUT))
         except (TypeError, ValueError) as err:
             raise HomeAssistantError(
                 "Narwal send_command: timeout must be a number"
@@ -702,8 +714,8 @@ class NarwalVacuum(NarwalEntity, RestoreEntity, StateVacuumEntity):
             )
 
         async with self.coordinator.dock_action_lock:
-            await self._ensure_awake()
             try:
+                await self._ensure_awake()
                 resp = await self.coordinator.client.send_command(
                     topic, payload, timeout=timeout
                 )
@@ -726,7 +738,8 @@ class NarwalVacuum(NarwalEntity, RestoreEntity, StateVacuumEntity):
                 "response_hex": (resp.raw_payload or b"").hex(),
             },
         )
-        _raise_if_command_failed(resp, f"command {topic}")
+        if not topic.rsplit("/", 1)[-1].startswith("get"):
+            _raise_if_command_failed(resp, f"command {topic}")
 
     async def async_set_fan_speed(self, fan_speed: str, **kwargs) -> None:
         """Set the fan speed.
