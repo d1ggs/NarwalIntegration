@@ -1893,6 +1893,20 @@ class TestMapUpdateRegions:
         m = MapData.from_response(_get_map_reply(b""))
         assert [(r.region_id, r.reason_name) for r in m.update_regions] == [(0, "default")]
 
+    @pytest.mark.parametrize("raw", [b"\xff\xff", "undecodable"])
+    def test_undecoded_entry_still_counts(self, raw: bytes | str) -> None:
+        """An entry bbp returns as bytes or str (not a message) is a proposal with id 0."""
+        decoded = _get_map_reply()
+        decoded["2"]["27"] = raw
+        m = MapData.from_response(decoded)
+        assert [(r.region_id, r.reason) for r in m.update_regions] == [(0, 0)]
+
+    def test_undecoded_entry_next_to_decoded_one(self) -> None:
+        decoded = _get_map_reply(_update_region(3, 1), _update_region(9, 0))
+        decoded["2"]["27"][1] = b"\xff\xff"
+        m = MapData.from_response(decoded)
+        assert [(r.region_id, r.reason) for r in m.update_regions] == [(3, 1), (0, 0)]
+
 
 class TestObstacleInfo:
     """Tests for ObstacleInfo dataclass."""

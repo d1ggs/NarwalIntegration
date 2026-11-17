@@ -591,11 +591,14 @@ def _parse_update_regions(field27: Any) -> list[MapUpdateRegion]:
 
     bbp yields a dict for a single entry and a list for several. An entry
     whose fields are all default decodes as an empty dict and still counts.
+    An entry bbp could not decode as a message (bytes or str) still counts
+    too, as id 0 with the default reason.
     """
     items = field27 if isinstance(field27, list) else [field27]
     regions: list[MapUpdateRegion] = []
     for item in items:
         if not isinstance(item, dict):
+            regions.append(MapUpdateRegion())
             continue
         try:
             regions.append(MapUpdateRegion(
