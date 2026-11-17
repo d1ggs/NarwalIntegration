@@ -121,6 +121,9 @@
       },
       "replacement_required": {
         "name": "Replacement required"
+      },
+      "map_update_suggested": {
+        "name": "Map update suggested"
       }
     },
     "select": {

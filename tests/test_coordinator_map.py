@@ -145,6 +145,52 @@ class TestCoordinatorMapRefresh:
 
         coordinator.hass.async_create_task.assert_called_once()
 
+    def test_clean_end_refreshes_map_once(self) -> None:
+        """Cleaning -> docked re-reads the map once (the robot lists proposed
+        map updates there); staying docked does not read it again."""
+        coordinator = self._make_coordinator()
+        coordinator._prev_working_status = WorkingStatus.CLEANING_ALT
+        state = NarwalState()
+        state.map_data = MapData(map_id=7)
+        state.working_status = WorkingStatus.DOCKED_V2
+
+        coordinator._on_state_update(state)
+        coordinator._on_state_update(state)
+
+        names = _background_task_names(coordinator)
+        assert names.count("narwal_map_refresh_after_clean") == 1
+
+    def test_no_map_refresh_without_clean_end(self) -> None:
+        """Starting a clean, or idling, does not re-read the map."""
+        coordinator = self._make_coordinator()
+        coordinator._prev_working_status = WorkingStatus.STANDBY
+        state = NarwalState()
+        state.map_data = MapData(map_id=7)
+        state.working_status = WorkingStatus.CLEANING
+
+        coordinator._on_state_update(state)
+
+        assert "narwal_map_refresh_after_clean" not in _background_task_names(coordinator)
+
+    async def test_map_refresh_after_clean_publishes_new_map(self) -> None:
+        """The refresh reuses get_map and pushes the new state to entities."""
+        coordinator = self._make_coordinator()
+        coordinator.client.get_map = AsyncMock()
+
+        await coordinator._refresh_map_after_clean()
+
+        coordinator.client.get_map.assert_awaited_once()
+        coordinator.async_set_updated_data.assert_called_once_with(coordinator.client.state)
+
+    async def test_map_refresh_after_clean_failure_is_quiet(self) -> None:
+        """A failed read keeps the previous map and does not raise."""
+        coordinator = self._make_coordinator()
+        coordinator.client.get_map = AsyncMock(side_effect=TimeoutError)
+
+        await coordinator._refresh_map_after_clean()
+
+        coordinator.async_set_updated_data.assert_not_called()
+
     def test_standby_to_cleaning_no_dock_refresh(self) -> None:
         """Transition from STANDBY to CLEANING does NOT trigger dock refresh."""
         coordinator = self._make_coordinator()

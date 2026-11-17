@@ -112,6 +112,20 @@ BINARY_SENSOR_DESCRIPTIONS: tuple[NarwalBinarySensorEntityDescription, ...] = (
         } if s.raw_base_status else None,
     ),
     NarwalBinarySensorEntityDescription(
+        key="map_update_suggested",
+        translation_key="map_update_suggested",
+        device_class=BinarySensorDeviceClass.UPDATE,
+        # get_map field 2.27 updateMapRegions: areas the robot proposes adding to
+        # the saved map (the app's "new area found" prompt). An absent field means
+        # no proposal; only a map never read is unknown.
+        value_fn=lambda s: bool(s.map_data.update_regions) if s.map_data else None,
+        attrs_fn=lambda s: {
+            "count": len(s.map_data.update_regions),
+            "region_ids": [r.region_id for r in s.map_data.update_regions],
+            "reasons": [r.reason_name for r in s.map_data.update_regions],
+        } if s.map_data else None,
+    ),
+    NarwalBinarySensorEntityDescription(
         key="clean_water_tank",
         translation_key="clean_water_tank",
         device_class=BinarySensorDeviceClass.PROBLEM,

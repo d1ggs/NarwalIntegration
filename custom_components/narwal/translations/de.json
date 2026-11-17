@@ -121,6 +121,9 @@
       },
       "replacement_required": {
         "name": "Austausch nötig"
+      },
+      "map_update_suggested": {
+        "name": "Kartenaktualisierung vorgeschlagen"
       }
     },
     "select": {

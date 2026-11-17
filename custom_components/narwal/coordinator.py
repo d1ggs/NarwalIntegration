@@ -2714,6 +2714,13 @@ class NarwalCoordinator(DataUpdateCoordinator[NarwalState]):
         ):
             _LOGGER.info("Return-to-dock detected, refreshing dock status")
             self.hass.async_create_task(self._refresh_dock_status())
+            # The robot proposes map updates (new areas found while cleaning)
+            # inside the map itself, so re-read it once per finished clean.
+            self.config_entry.async_create_background_task(
+                self.hass,
+                self._refresh_map_after_clean(),
+                f"{DOMAIN}_map_refresh_after_clean",
+            )
         self._handle_working_status_transition(state)
         self._retain_native_trajectory(state)
         self._schedule_map_display_cache_save(state)
@@ -2818,6 +2825,15 @@ class NarwalCoordinator(DataUpdateCoordinator[NarwalState]):
                 self._last_topic_subscribe = time.monotonic()
             except Exception:
                 _LOGGER.debug("Topic subscription failed after map load")
+        self.async_set_updated_data(self.client.state)
+
+    async def _refresh_map_after_clean(self) -> None:
+        """Re-read the static map once after a clean ends."""
+        try:
+            await self.client.get_map()
+        except Exception:
+            _LOGGER.debug("Map refresh after clean failed")
+            return
         self.async_set_updated_data(self.client.state)
 
     async def _resub_topics(self) -> None:

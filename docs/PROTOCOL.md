@@ -512,6 +512,7 @@ absent fields as unknown; do not substitute zero.
 | 2.13 | Historical trajectory `{1: x, 2: y}` |
 | 2.17 | Entire map, gzip-compressed (~20 KB) |
 | 2.26 | Room boundary polygons, one per room |
+| 2.27 | **Proposed map updates** — see below |
 | 2.32 | Furniture/annotations — type 14 doors, 2 furniture, 28 obstacles. Map-editor placed, **not** live detection |
 | 2.33 | Map area |
 | 2.34 | Creation timestamp |
@@ -538,6 +539,24 @@ enum, no product key — and resolves through one shared `en-US.json`:
 | **4** Kitchen | **5** Bathroom | **6** Toilet | **7** Balcony |
 | **8** Dining room | **9** Closet | **10** Corridor | **11** Study |
 | **12** Kids' room | **13** Entertainment room | **14** Storage room | **15** Others |
+
+### Proposed map updates (field 2.27)
+
+`StaticMapPayload.updateMapRegions`, a repeated `UpdateMapRegion` (from the app's generated
+protobuf code). The robot fills it when it finds an area the saved map lacks; the app does
+not compute anything and shows its "new area found" prompt whenever the list is non-empty.
+An absent field means no proposal. No populated capture yet; the layout is from the app only.
+
+| Sub-field | Meaning |
+|---|---|
+| 1 | `region` — outline cells (repeated `Grid`) |
+| 2 | `id` (uint32) |
+| 3 | `displayPose` — where the app draws the prompt icon (`PoseData`) |
+| 4 | `updateReason` — 0 `REGION_UPDATE_DEFAULT`, 1 `REGION_UPDATE_FOR_DOOR_THRESHOLD` |
+
+The `map_update_suggested` binary sensor is on while this list is non-empty. The integration
+re-reads the map once when a clean ends (cleaning → standby or docked), because proposals
+come from cleaning runs and the map is otherwise read only at startup or on demand.
 
 ### Coordinate transform
 

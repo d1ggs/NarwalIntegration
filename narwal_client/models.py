@@ -474,6 +474,33 @@ def _has_unmapped_dock_drying_timer(decoded: dict[str, Any]) -> bool:
     return False
 
 
+@dataclass
+class MapUpdateRegion:
+    """An area the robot proposes adding to the saved map.
+
+    Parsed from get_map field 2.27 (StaticMapPayload.updateMapRegions, repeated
+    UpdateMapRegion). The robot lists these itself; the app only shows its "new
+    area found" prompt while the list is non-empty.
+      field 1: region — outline cells (repeated Grid); not parsed
+      field 2: id (uint32)
+      field 3: displayPose — icon position (PoseData); not parsed
+      field 4: updateReason — 0 REGION_UPDATE_DEFAULT, 1 REGION_UPDATE_FOR_DOOR_THRESHOLD
+    """
+
+    region_id: int = 0
+    reason: int = 0
+
+    REASON_NAMES: ClassVar[dict[int, str]] = {
+        0: "default",
+        1: "door_threshold",
+    }
+
+    @property
+    def reason_name(self) -> str:
+        """Return the reason as a short name, unknown_<n> outside the enum."""
+        return self.REASON_NAMES.get(self.reason, f"unknown_{self.reason}")
+
+
 def _packed_varints(raw: bytes) -> list[int]:
     """Decode a protobuf packed repeated varint field."""
     out: list[int] = []
@@ -559,6 +586,27 @@ def _parse_obstacles(field32: dict) -> list[ObstacleInfo]:
     return obstacles
 
 
+def _parse_update_regions(field27: Any) -> list[MapUpdateRegion]:
+    """Parse proposed map updates from bbp-decoded field 2.27.
+
+    bbp yields a dict for a single entry and a list for several. An entry
+    whose fields are all default decodes as an empty dict and still counts.
+    """
+    items = field27 if isinstance(field27, list) else [field27]
+    regions: list[MapUpdateRegion] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            regions.append(MapUpdateRegion(
+                region_id=int(item.get("2", 0)),
+                reason=int(item.get("4", 0)),
+            ))
+        except (ValueError, TypeError):
+            continue
+    return regions
+
+
 @dataclass
 class MapData:
     """Map data from get_map response."""
@@ -576,6 +624,8 @@ class MapData:
     origin_x: int = 0  # x pixel offset from field 2.6.3
     origin_y: int = 0  # y pixel offset from field 2.6.1
     obstacles: list[ObstacleInfo] = field(default_factory=list)
+    # Proposed map updates from field 2.27; empty when the field is absent
+    update_regions: list[MapUpdateRegion] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -655,6 +705,12 @@ class MapData:
         if isinstance(field32, dict):
             obstacles = _parse_obstacles(field32)
 
+        # Proposed map updates from field 27 (updateMapRegions). Absent = none.
+        update_regions: list[MapUpdateRegion] = []
+        field27 = payload.get("27")
+        if field27 is not None:
+            update_regions = _parse_update_regions(field27)
+
         return cls(
             map_id=int(payload.get("1", 0)),
             width=int(payload.get("4", 0)),
@@ -669,6 +725,7 @@ class MapData:
             origin_x=origin_x,
             origin_y=origin_y,
             obstacles=obstacles,
+            update_regions=update_regions,
             raw=payload,
         )
 

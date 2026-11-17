@@ -1818,6 +1818,82 @@ class TestMapData:
         assert m.obstacles == []
 
 
+def _pb_varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        low, n = n & 0x7F, n >> 7
+        if n:
+            out.append(low | 0x80)
+        else:
+            out.append(low)
+            return bytes(out)
+
+
+def _pb_int(field_no: int, value: int) -> bytes:
+    return _pb_varint(field_no << 3) + _pb_varint(value)
+
+
+def _pb_msg(field_no: int, body: bytes) -> bytes:
+    return _pb_varint(field_no << 3 | 2) + _pb_varint(len(body)) + body
+
+
+def _update_region(region_id: int, reason: int | None) -> bytes:
+    """UpdateMapRegion: 1 region (repeated Grid), 2 id, 3 displayPose, 4 updateReason."""
+    body = _pb_msg(1, _pb_int(1, 10) + _pb_int(2, 20))
+    body += _pb_msg(1, _pb_int(1, 11) + _pb_int(2, 21))
+    body += _pb_int(2, region_id)
+    body += _pb_msg(3, _pb_msg(1, _pb_int(1, 15) + _pb_int(2, 25)))
+    if reason is not None:  # proto3 omits the default value 0
+        body += _pb_int(4, reason)
+    return body
+
+
+def _get_map_reply(*regions: bytes) -> dict:
+    """Decode a synthetic map/get_map reply the way the client does (bbp, no schema).
+
+    No populated field 27 has ever been captured from a robot: these payloads are
+    built from the app's protobuf layout (StaticMapPayload field 27 updateMapRegions,
+    repeated UpdateMapRegion), not from a capture.
+    """
+    import blackboxprotobuf
+
+    static_map = _pb_int(1, 7) + _pb_int(3, 60) + _pb_int(4, 10) + _pb_int(5, 10)
+    for region in regions:
+        static_map += _pb_msg(27, region)
+    decoded, _ = blackboxprotobuf.decode_message(_pb_int(1, 1) + _pb_msg(2, static_map))
+    return decoded
+
+
+class TestMapUpdateRegions:
+    """Proposed map updates from get_map field 2.27 (synthetic payloads, see above)."""
+
+    def test_absent_field_means_no_proposal(self) -> None:
+        m = MapData.from_response(_get_map_reply())
+        assert m.map_id == 7
+        assert m.update_regions == []
+
+    def test_one_region(self) -> None:
+        m = MapData.from_response(_get_map_reply(_update_region(3, None)))
+        assert [(r.region_id, r.reason_name) for r in m.update_regions] == [(3, "default")]
+
+    def test_two_regions_with_both_reasons(self) -> None:
+        m = MapData.from_response(
+            _get_map_reply(_update_region(3, 0), _update_region(9, 1))
+        )
+        assert [(r.region_id, r.reason) for r in m.update_regions] == [(3, 0), (9, 1)]
+        assert [r.reason_name for r in m.update_regions] == ["default", "door_threshold"]
+
+    def test_unknown_reason_value(self) -> None:
+        m = MapData.from_response(_get_map_reply(_update_region(4, 7)))
+        assert m.update_regions[0].reason == 7
+        assert m.update_regions[0].reason_name == "unknown_7"
+
+    def test_all_default_entry_still_counts(self) -> None:
+        """An entry with every field at its default decodes as {} and is a proposal."""
+        m = MapData.from_response(_get_map_reply(b""))
+        assert [(r.region_id, r.reason_name) for r in m.update_regions] == [(0, "default")]
+
+
 class TestObstacleInfo:
     """Tests for ObstacleInfo dataclass."""
 

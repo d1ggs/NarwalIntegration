@@ -121,6 +121,9 @@
       },
       "replacement_required": {
         "name": "교체 필요"
+      },
+      "map_update_suggested": {
+        "name": "지도 업데이트 제안"
       }
     },
     "select": {

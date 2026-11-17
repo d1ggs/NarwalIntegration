@@ -18,7 +18,7 @@ from custom_components.narwal.sensor import (  # noqa: E402
     NarwalDockSensor,
     NarwalSensor,
 )
-from narwal_client.models import NarwalState  # noqa: E402
+from narwal_client.models import MapData, MapUpdateRegion, NarwalState  # noqa: E402
 
 _DESCS = {d.key: d for d in BINARY_SENSOR_DESCRIPTIONS}
 _SENSOR_DESCS = {d.key: d for d in SENSOR_DESCRIPTIONS}
@@ -191,3 +191,50 @@ def test_unspecified_is_not_a_problem() -> None:
     s = NarwalState()
     s.update_from_base_status({"24": 0})
     assert fn(s) is False
+
+
+def test_map_update_suggested() -> None:
+    """Unknown until a map is read; off when field 27 is absent; on with regions."""
+    desc = _DESCS["map_update_suggested"]
+    s = NarwalState()
+    assert desc.value_fn(s) is None  # map never read
+    assert desc.attrs_fn(s) is None
+
+    s.map_data = MapData(map_id=7)  # map without field 27
+    assert desc.value_fn(s) is False
+    assert desc.attrs_fn(s) == {"count": 0, "region_ids": [], "reasons": []}
+
+    s.map_data = MapData(
+        map_id=7,
+        update_regions=[
+            MapUpdateRegion(region_id=3, reason=0),
+            MapUpdateRegion(region_id=9, reason=1),
+            MapUpdateRegion(region_id=12, reason=5),
+        ],
+    )
+    assert desc.value_fn(s) is True
+    assert desc.attrs_fn(s) == {
+        "count": 3,
+        "region_ids": [3, 9, 12],
+        "reasons": ["default", "door_threshold", "unknown_5"],
+    }
+
+
+def test_map_update_suggested_entity() -> None:
+    """The sensor sits on the robot device, enabled by default, keyed for HA."""
+    desc = _DESCS["map_update_suggested"]
+    coordinator = _coordinator()
+    coordinator.data.map_data = MapData(
+        map_id=7, update_regions=[MapUpdateRegion(region_id=3)]
+    )
+    sensor = NarwalBinarySensor(coordinator, desc)
+
+    assert not desc.dock_device
+    assert getattr(desc, "entity_registry_enabled_default", True) is not False
+    assert sensor._attr_unique_id == "test_device_map_update_suggested"
+    assert sensor.is_on is True
+    assert sensor.extra_state_attributes == {
+        "count": 1,
+        "region_ids": [3],
+        "reasons": ["default"],
+    }

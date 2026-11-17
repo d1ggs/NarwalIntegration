@@ -118,6 +118,9 @@
       },
       "replacement_required": {
         "name": "Remplacement requis"
+      },
+      "map_update_suggested": {
+        "name": "Mise à jour de la carte proposée"
       }
     },
     "select": {
