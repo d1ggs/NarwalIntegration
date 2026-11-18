@@ -13,8 +13,11 @@ robot clock to Europe/Rome.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import importlib
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -267,16 +270,42 @@ class TestRead:
         await _read(vac)
         vac.hass.bus.async_fire.assert_not_called()
 
-    async def test_does_not_take_the_action_lock(self) -> None:
+    @pytest.mark.parametrize("topic", ["map/get_map", "region/get", "config/get"])
+    async def test_known_read_does_not_take_the_action_lock(self, topic: str) -> None:
         """A polled read on a sleeping robot must not delay stop or return."""
         vac = _vacuum()
         lock = vac.coordinator.dock_action_lock
         await lock.acquire()
         try:
-            response = await asyncio.wait_for(_read(vac), 1)
+            response = await asyncio.wait_for(_read(vac, topic), 1)
         finally:
             lock.release()
         assert response == {"response_hex": "0801", "response_bytes": 2}
+
+    @pytest.mark.parametrize(
+        "topic",
+        [
+            "config/set",
+            "region/set",
+            "common/reboot",
+            "consumable/reset_consumable_info",
+            "common/yell",
+            "developer/led_control",
+        ],
+    )
+    async def test_other_topic_takes_the_action_lock(self, topic: str) -> None:
+        """The read action cannot tell a read from a write, so it locks like one."""
+        vac = _vacuum()
+        lock = vac.coordinator.dock_action_lock
+
+        async def _send(*_args, **_kwargs):
+            assert lock.locked()
+            return CommandResponse(result_code=CommandResult.SUCCESS)
+
+        vac.coordinator.client.send_command = AsyncMock(side_effect=_send)
+        await _read(vac, topic)
+        vac.coordinator.client.send_command.assert_awaited_once()
+        assert not lock.locked()
 
     async def test_wakes_without_the_action_lock(self) -> None:
         vac = _vacuum()
@@ -390,8 +419,20 @@ class TestShared:
         assert answered
         assert not answered & set(module._NATIVE_TOPICS)
         assert not answered & UNACKNOWLEDGED_TOPICS
-        for topic in answered - module._RAW_READ_ALLOWED_TOPICS:
+        assert not answered & module._SESSION_TOPICS
+        for topic in answered - module._RAW_READ_TOPICS:
             assert not topic.startswith(module._NATIVE_TOPIC_PREFIXES)
+
+    @pytest.mark.parametrize(
+        "topic", ["common/active_robot_publish", "common/notify_app_event"]
+    )
+    async def test_session_topic_is_refused(self, action: str, topic: str) -> None:
+        """A raw copy can end the integration's subscription without it knowing (#73)."""
+        vac = _vacuum()
+        with pytest.raises(_HomeAssistantError, match="awake and subscribed") as err:
+            await _call(vac, action, topic)
+        assert topic in str(err.value)
+        vac.coordinator.client.send_command.assert_not_awaited()
 
     @pytest.mark.parametrize(("payload_hex", "body"), [(1234, b"\x12\x34"), (12, b"\x12")])
     async def test_int_payload_is_read_as_hex_text(
@@ -472,3 +513,114 @@ class TestShared:
         with pytest.raises(_HomeAssistantError):
             await _call(vac, action, "region/get")
         vac.coordinator.client.send_command.assert_not_awaited()
+
+
+def _client_const(module):
+    """The embedded client's const module, the one the vacuum imports."""
+    return importlib.import_module(f"{module.__package__}.narwal_client.const")
+
+
+def _client_topic_constants(const) -> dict[str, str]:
+    return {
+        name: value for name, value in vars(const).items() if name.startswith("TOPIC_CMD_")
+    }
+
+
+def _awaited_topic_names(client_source: str) -> tuple[set[str], set[str]]:
+    """TOPIC_CMD_* names the client passes to self.send_command, and the rest.
+
+    A method that forwards one of its own parameters to self.send_command
+    (today only _start_dock_task, called with the dock task topics) is
+    followed to its call sites, so those topics count too. Any other first
+    argument is returned in the second set so a new indirect path fails the
+    test instead of being missed.
+    """
+    tree = ast.parse(client_source)
+
+    def _is_self_call(node: ast.AST, attr: str) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == attr
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        )
+
+    def _topic_arg(call: ast.Call, index: int, keyword: str) -> ast.AST | None:
+        if len(call.args) > index:
+            return call.args[index]
+        return next((k.value for k in call.keywords if k.arg == keyword), None)
+
+    found: set[str] = set()
+    unresolved: set[str] = set()
+    forwarders: dict[str, tuple[int, str]] = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        params = [a.arg for a in func.args.args]
+        for node in ast.walk(func):
+            if not _is_self_call(node, "send_command"):
+                continue
+            arg = _topic_arg(node, 0, "short_topic")
+            if isinstance(arg, ast.Name) and arg.id.startswith("TOPIC_CMD_"):
+                found.add(arg.id)
+            elif isinstance(arg, ast.Name) and arg.id in params and func.name != "send_command":
+                # Index among call arguments, excluding self.
+                forwarders[func.name] = (params.index(arg.id) - 1, arg.id)
+            else:
+                unresolved.add(f"{func.name}: {ast.unparse(arg) if arg else None}")
+    for node in ast.walk(tree):
+        for name, (index, keyword) in forwarders.items():
+            if not _is_self_call(node, name):
+                continue
+            arg = _topic_arg(node, index, keyword)
+            if isinstance(arg, ast.Name) and arg.id.startswith("TOPIC_CMD_"):
+                found.add(arg.id)
+            else:
+                unresolved.add(f"{name} call: {ast.unparse(arg) if arg else None}")
+    return found, unresolved
+
+
+class TestTopicClassification:
+    """Every client topic is classified, so a new one cannot slip through."""
+
+    # Defined in const.py but never sent by the client, so nothing awaits them.
+    _UNRESTRICTED = ("TOPIC_CMD_REBOOT", "TOPIC_CMD_SHUTDOWN", "TOPIC_CMD_PING")
+
+    def test_every_client_topic_is_in_exactly_one_group(self) -> None:
+        module = _vacuum_module(_vacuum())
+        const = _client_const(module)
+        constants = _client_topic_constants(const)
+        assert len(constants) > 30
+        groups = {
+            "native": set(module._NATIVE_TOPICS),
+            "session": set(module._SESSION_TOPICS),
+            "unacknowledged": set(module.UNACKNOWLEDGED_TOPICS),
+            "answered": set(module._RAW_ANSWERED_TOPICS),
+            "unrestricted": {getattr(const, name) for name in self._UNRESTRICTED},
+        }
+        for name, topic in constants.items():
+            homes = [group for group, topics in groups.items() if topic in topics]
+            assert len(homes) == 1, f"{name} ({topic}) is in {homes or 'no group'}"
+
+    def test_every_awaited_client_topic_is_refused_or_answered(self) -> None:
+        module = _vacuum_module(_vacuum())
+        const = _client_const(module)
+        source = Path(const.__file__).with_name("client.py").read_text(encoding="utf-8")
+        names, unresolved = _awaited_topic_names(source)
+        assert not unresolved, unresolved
+        # The scan must reach both direct calls and the dock task helper.
+        assert {"TOPIC_CMD_GET_MAP", "TOPIC_CMD_WASH_MOP"} <= names
+        allowed = set(module._NATIVE_TOPICS) | module._RAW_ANSWERED_TOPICS
+        missing = sorted(name for name in names if getattr(const, name) not in allowed)
+        assert not missing, missing
+
+    def test_read_topics_are_never_refused_and_never_act(self) -> None:
+        module = _vacuum_module(_vacuum())
+        const = _client_const(module)
+        reads = module._RAW_READ_TOPICS
+        assert not reads & set(module._NATIVE_TOPICS)
+        assert not reads & module._SESSION_TOPICS
+        assert not reads & module.UNACKNOWLEDGED_TOPICS
+        assert const.TOPIC_CMD_YELL not in reads
+        assert const.TOPIC_CMD_SET_LED not in reads

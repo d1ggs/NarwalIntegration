@@ -62,6 +62,7 @@ from .narwal_client import (
 from .narwal_client.const import (
     ACTIVE_CLEANING_STATUSES,
     COMMAND_RESPONSE_TIMEOUT,
+    TOPIC_CMD_ACTIVE_ROBOT,
     TOPIC_CMD_AMBIENT_LIGHT_CTRL,
     TOPIC_CMD_CANCEL,
     TOPIC_CMD_CLEAN_TASK,
@@ -79,6 +80,7 @@ from .narwal_client.const import (
     TOPIC_CMD_GET_DEVICE_INFO,
     TOPIC_CMD_GET_FEATURE_LIST,
     TOPIC_CMD_GET_MAP,
+    TOPIC_CMD_NOTIFY_APP_EVENT,
     TOPIC_CMD_PAUSE,
     TOPIC_CMD_PLAN_START,
     TOPIC_CMD_RECALL,
@@ -123,10 +125,32 @@ _NATIVE_TOPICS: dict[str, str] = {
     TOPIC_CMD_SET_MOP_HUMIDITY: "the Mopping humidity select",
     TOPIC_CMD_AMBIENT_LIGHT_CTRL: "the Dock light entity",
 }
-# Any other clean/ or task/ topic is refused too, except these known reads,
-# which narwal.get_topic_response may send. vacuum.send_command gets none.
+# The integration's wake burst and topic subscription. A raw copy can end the
+# subscription without the client knowing, so status updates stop (#73).
+_SESSION_TOPICS = frozenset({TOPIC_CMD_ACTIVE_ROBOT, TOPIC_CMD_NOTIFY_APP_EVENT})
+# Any other clean/ or task/ topic is refused too, except a topic in
+# _RAW_READ_TOPICS sent by narwal.get_topic_response. vacuum.send_command
+# gets no exception.
 _NATIVE_TOPIC_PREFIXES = ("clean/", "task/")
-_RAW_READ_ALLOWED_TOPICS = frozenset({TOPIC_CMD_GET_CURRENT_TASK})
+# Topics known only to read. A topic not on this list is treated as a possible
+# write, because the action cannot tell; it takes the dock action lock so it
+# cannot land between another action's state check and its command.
+_RAW_READ_TOPICS = frozenset(
+    {
+        TOPIC_CMD_GET_DEVICE_INFO,
+        TOPIC_CMD_GET_FEATURE_LIST,
+        TOPIC_CMD_GET_BASE_STATUS,
+        TOPIC_CMD_GET_CONSUMABLE_INFO,
+        TOPIC_CMD_GET_CURRENT_TASK,
+        TOPIC_CMD_GET_MAP,
+        TOPIC_CMD_GET_ALL_MAPS,
+        TOPIC_CMD_TAKE_PICTURE,
+        TOPIC_CMD_GET_DEBUG_IMAGE,
+        # Documented setting reads the client never sends itself.
+        "config/get",
+        "region/get",
+    }
+)
 # Topics the client itself sends and waits on, which the raw actions may send.
 # A timeout on these means the reply is late, not missing, so the request keeps
 # its place like the client's own would and the late reply is dropped. Any
@@ -842,12 +866,20 @@ class NarwalVacuum(NarwalEntity, RestoreEntity, StateVacuumEntity):
         Field 1 of a read reply can be data rather than a result code, so the
         reply is never judged: a refusal comes back as its bytes (``0802`` is
         NOT_APPLICABLE) for the caller to decode.
+
+        Only a topic in ``_RAW_READ_TOPICS`` is sent without the dock action
+        lock. Any other topic may be a write, so it takes the lock like
+        ``vacuum.send_command``.
         """
         topic, payload, timeout = self._parse_raw_request(
             "get_topic_response", topic, payload_hex, timeout, read=True
         )
         resp = await self._async_send_raw(
-            "get_topic_response", topic, payload, timeout, lock=False
+            "get_topic_response",
+            topic,
+            payload,
+            timeout,
+            lock=topic not in _RAW_READ_TOPICS,
         )
         raw = resp.raw_payload or b""
         return {"response_hex": raw.hex(), "response_bytes": len(raw)}
@@ -880,8 +912,14 @@ class NarwalVacuum(NarwalEntity, RestoreEntity, StateVacuumEntity):
                 f"Narwal {action}: {short_topic} is sent by the integration "
                 f"itself; use {_NATIVE_TOPICS[short_topic]} instead"
             )
+        if short_topic in _SESSION_TOPICS:
+            raise HomeAssistantError(
+                f"Narwal {action}: {short_topic} keeps the integration's own "
+                "connection awake and subscribed; sending it raw can stop "
+                "status updates"
+            )
         if short_topic.startswith(_NATIVE_TOPIC_PREFIXES) and not (
-            read and short_topic in _RAW_READ_ALLOWED_TOPICS
+            read and short_topic in _RAW_READ_TOPICS
         ):
             raise HomeAssistantError(
                 f"Narwal {action}: {short_topic} is refused; clean/ and task/ "
@@ -910,9 +948,10 @@ class NarwalVacuum(NarwalEntity, RestoreEntity, StateVacuumEntity):
             raise HomeAssistantError(
                 f"Narwal {action}: timeout must be a number"
             ) from err
-        # Capped like start/return: a write holds the dock action lock, and
-        # any request holds the client's command lock, so a topic the robot
-        # ignores delays other commands for up to this long.
+        # Capped like start/return: any topic not known to be a read holds
+        # the dock action lock, and any request holds the client's command
+        # lock, so a topic the robot ignores delays other commands for up to
+        # this long.
         if not _RAW_TIMEOUT_MIN <= seconds <= self._ACTION_TIMEOUT:
             raise HomeAssistantError(
                 f"Narwal {action}: timeout must be "
@@ -931,12 +970,14 @@ class NarwalVacuum(NarwalEntity, RestoreEntity, StateVacuumEntity):
     ) -> CommandResponse:
         """Wake the robot and send one raw topic.
 
-        Writes (``lock``) hold the dock action lock: a raw write cannot be
-        classified as dock-safe, and without the lock it could land between
-        another action's state check and its command. Reads skip it, so a
-        polled read on a sleeping robot cannot delay stop or return by the
-        wake plus the timeout; the client's command lock still serialises
-        the frames.
+        With ``lock``, the wake and send hold the dock action lock: a raw
+        write cannot be classified as dock-safe, and without the lock it
+        could land between another action's state check and its command.
+        Callers pass ``lock=True`` for every ``vacuum.send_command`` and for
+        any ``narwal.get_topic_response`` topic not in ``_RAW_READ_TOPICS``.
+        Only those known reads skip it, so a polled read on a sleeping robot
+        cannot delay stop or return by the wake plus the timeout; the
+        client's command lock still serialises the frames.
 
         A topic in ``_RAW_ANSWERED_TOPICS`` keeps its reply place after a
         timeout, as the client's own request would, so its late reply is

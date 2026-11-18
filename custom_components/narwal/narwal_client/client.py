@@ -1251,10 +1251,12 @@ class NarwalClient:
             hold_place_on_timeout: If False, a command that times out gives up
                 its place at once, so the next response goes to the next
                 request. A late answer is then discarded if no request is owed
-                one, but taken as the answer to any command still in flight.
-                Meant for user-supplied topics, where a timeout most likely
-                means the robot ignored the topic. A cancelled wait gives up
-                the place the same way.
+                one, but taken as the answer to the next request in line.
+                Only for user-supplied topics the client has never seen
+                answered, where a timeout most likely means the robot ignored
+                the topic; keep the default for any topic known to be
+                answered. A cancelled wait gives up the place the same way.
+                See the comment at the release path.
 
         Returns:
             CommandResponse with result code and decoded data.
@@ -1296,6 +1298,21 @@ class NarwalClient:
                         # No listener — read directly from websocket
                         msg = await self._wait_for_field5_response(timeout, future)
                 except (NarwalCommandError, asyncio.CancelledError):
+                    # Replies carry no topic, so both choices after a timeout
+                    # are wrong in one case. Keeping the place drops a late
+                    # answer. But if the robot ignored the topic, the place
+                    # swallows the next genuine reply for timeout +
+                    # LATE_RESPONSE_GRACE, every time, and that request fails.
+                    # Giving up the place fixes that. But a late answer is then
+                    # handed to the next request in line, which resolves with
+                    # another topic's payload.
+                    # So giving up the place is only right when a timeout most
+                    # likely means the robot ignored the topic: a user-supplied
+                    # topic the client has never seen answered. A caller must
+                    # keep the default for any topic known to be answered,
+                    # where a timeout means the reply is late.
+                    # Neither choice is fully safe; a reply that named its
+                    # topic would be.
                     if not hold_place_on_timeout:
                         with contextlib.suppress(ValueError):
                             self._expected_responses.remove(expected)

@@ -39,9 +39,14 @@ state. The error names what to use instead:
 | `clean/set_mop_humidity` | Mopping humidity select |
 | `supply/ambient_light_ctrl` | Dock light |
 
+`common/active_robot_publish` and `common/notify_app_event` are refused by both actions too.
+The integration sends them to keep its own connection awake and subscribed. A raw copy can end
+that subscription without the integration knowing, so status updates stop. There is no other
+action for them.
+
 Any other topic under `clean/` or `task/` is refused as well. The one exception is the read
 `clean/current_clean_task/get`, which `narwal.get_topic_response` may send. Other topics,
-such as `config/*`, `region/*`, `map/*` and `common/reboot`, are not restricted.
+such as `config/*`, `region/*`, `map/*` and `common/reboot`, are not refused.
 
 ## Change a setting
 
@@ -141,11 +146,17 @@ Freo 20, product key `fjhpiem4ba`, firmware v01.00.21.05:
   the same way.
 - **Writes make other actions wait.** `vacuum.send_command` holds the same lock as start, stop,
   pause, return to dock, locate, `narwal.clean_rooms` and the dock tasks, so those wait until
-  it finishes: up to 10 s to wake the robot plus the timeout. `narwal.get_topic_response` does
-  not take or wait for that lock. A read still goes through the one-command-at-a-time queue, so
-  another command can wait up to the read's timeout. Only the wait for the wake is gone.
-- **Reads skip the action lock.** `narwal.get_topic_response` sends whatever topic it is given
-  without that lock, so use `vacuum.send_command` for anything that changes a setting.
+  it finishes: up to 10 s to wake the robot plus the timeout. `narwal.get_topic_response` takes
+  the same lock, except for the known reads below.
+- **Only known reads skip the action lock.** `narwal.get_topic_response` sends these topics
+  without that lock: `common/get_device_info`, `common/get_feature_list`,
+  `status/get_device_base_status`, `consumable/get_consumable_info`,
+  `clean/current_clean_task/get`, `map/get_map`, `map/get_all_reduced_maps`,
+  `developer/take_picture`, `developer/get_robot_debug_image`, `config/get` and `region/get`.
+  For any other topic it takes the same lock as `vacuum.send_command`, because it cannot tell
+  a read from a write. Every request still goes through the one-command-at-a-time queue, so
+  another command can wait up to a read's timeout. A known read only skips the wait for the
+  wake.
 - **No undo.** Any user who can control the vacuum can send any topic that is not refused,
   including `common/reboot` and `common/shutdown`. Read a setting before changing it so you can put it
   back.
