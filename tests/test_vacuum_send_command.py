@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
+import re
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -262,7 +263,7 @@ class TestRead:
         vac = _vacuum()
         await _read(vac, "config/get", payload_hex="0a00", timeout=3)
         vac.coordinator.client.send_command.assert_awaited_once_with(
-            "config/get", bytes.fromhex("0a00"), timeout=3.0, hold_place_on_timeout=False
+            "config/get", bytes.fromhex("0a00"), timeout=3.0, hold_place_on_timeout=True
         )
 
     async def test_fires_no_event(self) -> None:
@@ -394,7 +395,7 @@ class TestShared:
         vac.coordinator.client.send_command.assert_not_awaited()
 
     @pytest.mark.parametrize(
-        "topic", ["config/set", "config/get", "region/get", "common/reboot", "config/gett"]
+        "topic", ["config/set", "region/set", "common/reboot", "config/gett"]
     )
     async def test_other_topics_are_sent(self, action: str, topic: str) -> None:
         """A topic not known to be answered gives up its place on a timeout."""
@@ -404,9 +405,12 @@ class TestShared:
             topic, b"", timeout=5.0, hold_place_on_timeout=False
         )
 
-    @pytest.mark.parametrize("topic", ["map/get_map", "common/yell", "developer/led_control"])
+    @pytest.mark.parametrize(
+        "topic",
+        ["map/get_map", "config/get", "region/get", "common/yell", "developer/led_control"],
+    )
     async def test_answered_topics_keep_their_place(self, action: str, topic: str) -> None:
-        """A timeout on a topic the client waits on means a late reply, not none."""
+        """A timeout on a topic known to be answered means a late reply, not none."""
         vac = _vacuum()
         await _call(vac, action, topic)
         vac.coordinator.client.send_command.assert_awaited_once_with(
@@ -529,27 +533,40 @@ def _client_topic_constants(const) -> dict[str, str]:
 def _awaited_topic_names(client_source: str) -> tuple[set[str], set[str]]:
     """TOPIC_CMD_* names the client passes to self.send_command, and the rest.
 
-    A method that forwards one of its own parameters to self.send_command
-    (today only _start_dock_task, called with the dock task topics) is
-    followed to its call sites, so those topics count too. Any other first
-    argument is returned in the second set so a new indirect path fails the
-    test instead of being missed.
+    Resolved (first set): a direct ``self.send_command(TOPIC_CMD_X, ...)``
+    call, and a call ``self.<forwarder>(TOPIC_CMD_X, ...)`` to a method that
+    passes one of its own positional parameters straight to
+    ``self.send_command`` (today only _start_dock_task, called with the dock
+    task topics). Topics are matched by name only, positionally or by keyword.
+
+    Reported (second set), never resolved, so a new indirect path fails the
+    test instead of being missed:
+    - a send_command or forwarder call whose topic argument is anything but
+      a TOPIC_CMD_* name (or, inside a forwarder, its own parameter);
+    - a forwarder that assigns to its topic parameter anywhere in its body;
+    - a forwarder with no ``self.<forwarder>(...)`` call site;
+    - send_command or a forwarder referenced other than as the callee of a
+      call (``functools.partial(self.send_command, ...)``, a callback, bound
+      to a variable), or named as the string ``"send_command"``;
+    - a send_command or forwarder call on a receiver other than ``self``.
     """
     tree = ast.parse(client_source)
-
-    def _is_self_call(node: ast.AST, attr: str) -> bool:
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == attr
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "self"
-        )
 
     def _topic_arg(call: ast.Call, index: int, keyword: str) -> ast.AST | None:
         if len(call.args) > index:
             return call.args[index]
         return next((k.value for k in call.keywords if k.arg == keyword), None)
+
+    def _method_calls(node: ast.AST, attr: str):
+        """Every call ``<receiver>.attr(...)`` under node, as (call, on_self)."""
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == attr
+            ):
+                receiver = call.func.value
+                yield call, isinstance(receiver, ast.Name) and receiver.id == "self"
 
     found: set[str] = set()
     unresolved: set[str] = set()
@@ -558,26 +575,52 @@ def _awaited_topic_names(client_source: str) -> tuple[set[str], set[str]]:
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         params = [a.arg for a in func.args.args]
-        for node in ast.walk(func):
-            if not _is_self_call(node, "send_command"):
-                continue
+        for node, on_self in _method_calls(func, "send_command"):
             arg = _topic_arg(node, 0, "short_topic")
-            if isinstance(arg, ast.Name) and arg.id.startswith("TOPIC_CMD_"):
+            shown = ast.unparse(arg) if arg else None
+            if not on_self:
+                unresolved.add(f"{func.name}: {ast.unparse(node.func)}({shown})")
+            elif isinstance(arg, ast.Name) and arg.id.startswith("TOPIC_CMD_"):
                 found.add(arg.id)
             elif isinstance(arg, ast.Name) and arg.id in params and func.name != "send_command":
-                # Index among call arguments, excluding self.
-                forwarders[func.name] = (params.index(arg.id) - 1, arg.id)
+                rebound = any(
+                    isinstance(n, ast.Name) and n.id == arg.id and isinstance(n.ctx, ast.Store)
+                    for n in ast.walk(func)
+                )
+                if rebound:
+                    unresolved.add(f"{func.name}: assigns to its topic parameter {arg.id}")
+                else:
+                    # Index among call arguments, excluding self.
+                    forwarders[func.name] = (params.index(arg.id) - 1, arg.id)
             else:
-                unresolved.add(f"{func.name}: {ast.unparse(arg) if arg else None}")
-    for node in ast.walk(tree):
-        for name, (index, keyword) in forwarders.items():
-            if not _is_self_call(node, name):
-                continue
+                unresolved.add(f"{func.name}: {shown}")
+    for name, (index, keyword) in forwarders.items():
+        sites = 0
+        for node, on_self in _method_calls(tree, name):
             arg = _topic_arg(node, index, keyword)
+            shown = ast.unparse(arg) if arg else None
+            if not on_self:
+                unresolved.add(f"{name} call: {ast.unparse(node.func)}({shown})")
+                continue
+            sites += 1
             if isinstance(arg, ast.Name) and arg.id.startswith("TOPIC_CMD_"):
                 found.add(arg.id)
             else:
-                unresolved.add(f"{name} call: {ast.unparse(arg) if arg else None}")
+                unresolved.add(f"{name} call: {shown}")
+        if not sites:
+            unresolved.add(f"{name}: forwarder with no self.{name}(...) call site")
+    # A reference that is not the callee of a call escapes the checks above.
+    callees = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    watched = {"send_command", *forwarders}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in watched
+            and id(node) not in callees
+        ):
+            unresolved.add(f"reference: {ast.unparse(node)}")
+        elif isinstance(node, ast.Constant) and node.value in watched:
+            unresolved.add(f"reference: {node.value!r}")
     return found, unresolved
 
 
@@ -624,3 +667,135 @@ class TestTopicClassification:
         assert not reads & module.UNACKNOWLEDGED_TOPICS
         assert const.TOPIC_CMD_YELL not in reads
         assert const.TOPIC_CMD_SET_LED not in reads
+        # Pinned: adding a topic here asserts it has no side effects, because a
+        # known read is sent without the dock action lock.
+        assert reads == _KNOWN_READS
+
+    def test_answered_topics_are_the_reads_plus_yell_and_led(self) -> None:
+        module = _vacuum_module(_vacuum())
+        answered = module._RAW_ANSWERED_TOPICS
+        assert answered == module._RAW_READ_TOPICS | {"common/yell", "developer/led_control"}
+
+    def test_docs_list_exactly_the_known_reads(self) -> None:
+        doc = Path(__file__).parents[1] / "docs" / "SEND-COMMAND.md"
+        text = doc.read_text(encoding="utf-8")
+        heading = "- **Only known reads skip the action lock.**"
+        start = text.index(heading)
+        end = text.find("\n- ", start + len(heading))
+        bullet = text[start : end if end != -1 else None]
+        # Action names contain a dot, so only topics match.
+        listed = re.findall(r"`([a-z0-9_/]+)`", bullet)
+        assert sorted(listed) == sorted(_KNOWN_READS)
+
+
+_KNOWN_READS = {
+    "common/get_device_info",
+    "common/get_feature_list",
+    "status/get_device_base_status",
+    "consumable/get_consumable_info",
+    "clean/current_clean_task/get",
+    "map/get_map",
+    "map/get_all_reduced_maps",
+    "developer/take_picture",
+    "developer/get_robot_debug_image",
+    "config/get",
+    "region/get",
+}
+
+_SCAN_HEADER = "TOPIC_CMD_A = 'a'\n"
+
+
+class TestAwaitedTopicScan:
+    """The scan reports every shape it cannot resolve instead of missing it."""
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param(
+                """
+class C:
+    async def go(self):
+        await self.send_command(TOPIC_CMD_A)
+""",
+                id="direct",
+            ),
+            pytest.param(
+                """
+class C:
+    async def _fwd(self, topic, payload=b""):
+        await self.send_command(topic, payload)
+
+    async def go(self):
+        await self._fwd(TOPIC_CMD_A)
+""",
+                id="forwarder",
+            ),
+        ],
+    )
+    def test_resolves(self, source: str) -> None:
+        assert _awaited_topic_names(_SCAN_HEADER + source) == ({"TOPIC_CMD_A"}, set())
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param(
+                """
+class C:
+    async def _fwd(self, topic):
+        topic = topic + "/x"
+        await self.send_command(topic)
+
+    async def go(self):
+        await self._fwd(TOPIC_CMD_A)
+""",
+                id="forwarder-reassigns-parameter",
+            ),
+            pytest.param(
+                """
+class C:
+    async def _fwd(self, topic):
+        await self.send_command(topic)
+""",
+                id="forwarder-without-call-site",
+            ),
+            pytest.param(
+                """
+import functools
+
+class C:
+    async def go(self):
+        send = functools.partial(self.send_command, TOPIC_CMD_A)
+        await send()
+""",
+                id="partial",
+            ),
+            pytest.param(
+                """
+class C:
+    def go(self, loop):
+        loop.call_soon(self.send_command, TOPIC_CMD_A)
+""",
+                id="callback",
+            ),
+            pytest.param(
+                """
+class C:
+    async def go(self):
+        send = self.send_command
+        await send(TOPIC_CMD_A)
+""",
+                id="bound-to-variable",
+            ),
+            pytest.param(
+                """
+class C:
+    async def go(self, other):
+        await other.send_command(TOPIC_CMD_A)
+""",
+                id="other-receiver",
+            ),
+        ],
+    )
+    def test_reports_unresolved(self, source: str) -> None:
+        _found, unresolved = _awaited_topic_names(_SCAN_HEADER + source)
+        assert unresolved

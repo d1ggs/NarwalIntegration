@@ -146,30 +146,18 @@ _RAW_READ_TOPICS = frozenset(
         TOPIC_CMD_GET_ALL_MAPS,
         TOPIC_CMD_TAKE_PICTURE,
         TOPIC_CMD_GET_DEBUG_IMAGE,
-        # Documented setting reads the client never sends itself.
+        # Setting reads documented as answered in docs/PROTOCOL.md; the client
+        # never sends them itself.
         "config/get",
         "region/get",
     }
 )
-# Topics the client itself sends and waits on, which the raw actions may send.
-# A timeout on these means the reply is late, not missing, so the request keeps
-# its place like the client's own would and the late reply is dropped. Any
-# other topic gives up its place, because the robot most likely ignored it.
-_RAW_ANSWERED_TOPICS = frozenset(
-    {
-        TOPIC_CMD_YELL,
-        TOPIC_CMD_GET_DEVICE_INFO,
-        TOPIC_CMD_GET_FEATURE_LIST,
-        TOPIC_CMD_GET_BASE_STATUS,
-        TOPIC_CMD_GET_CONSUMABLE_INFO,
-        TOPIC_CMD_GET_CURRENT_TASK,
-        TOPIC_CMD_GET_MAP,
-        TOPIC_CMD_GET_ALL_MAPS,
-        TOPIC_CMD_TAKE_PICTURE,
-        TOPIC_CMD_SET_LED,
-        TOPIC_CMD_GET_DEBUG_IMAGE,
-    }
-)
+# Topics known to be answered: every known read, plus the two acting topics the
+# client itself sends and awaits. A timeout on these means the reply is late,
+# so the request keeps its place as the client's own would and the late reply
+# is dropped. Any other topic gives up its place, because the robot most likely
+# ignored it.
+_RAW_ANSWERED_TOPICS = _RAW_READ_TOPICS | frozenset({TOPIC_CMD_YELL, TOPIC_CMD_SET_LED})
 
 ATTR_TOPIC = "topic"
 ATTR_PAYLOAD_HEX = "payload_hex"

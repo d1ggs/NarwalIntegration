@@ -138,8 +138,9 @@ Freo 20, product key `fjhpiem4ba`, firmware v01.00.21.05:
   answers blocks other commands, polls included, until its timeout. Topics known never to be
   answered are refused up front, but a mistyped topic the robot ignores still causes this. That
   is why the timeout is capped at 10 s.
-- **A late reply.** A raw request to a topic the integration itself uses and knows is answered
-  (`map/get_map` and the like) keeps its place after a timeout, so a late reply is dropped. A
+- **A late reply.** A raw request to a topic known to be answered keeps its place after a
+  timeout, so a late reply is dropped. Those topics are the known reads listed under "Only
+  known reads skip the action lock" below, plus `common/yell` and `developer/led_control`. A
   request to any other topic gives up its place at once, so the next command's reply is not
   discarded. A reply to it that arrives after the timeout can be taken for the next command's
   answer, if one is in flight. A cancelled request (a restarted automation) gives up its place

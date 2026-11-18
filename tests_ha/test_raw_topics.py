@@ -97,7 +97,7 @@ async def test_read_takes_an_all_digit_payload_given_as_int(
         return_response=True,
     )
     send_command.assert_awaited_once_with(
-        "config/get", b"\x12\x34", timeout=5.0, hold_place_on_timeout=False
+        "config/get", b"\x12\x34", timeout=5.0, hold_place_on_timeout=True
     )
 
 
