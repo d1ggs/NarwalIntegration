@@ -16,7 +16,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
-import re
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -218,18 +217,6 @@ class TestWrite:
             await vac.async_send_command("clean/current_clean_task/get")
         vac.coordinator.client.send_command.assert_not_awaited()
 
-    async def test_holds_the_action_lock_while_sending(self) -> None:
-        vac = _vacuum()
-        lock = vac.coordinator.dock_action_lock
-
-        async def _send(*_args, **_kwargs):
-            assert lock.locked()
-            return CommandResponse(result_code=CommandResult.SUCCESS)
-
-        vac.coordinator.client.send_command = AsyncMock(side_effect=_send)
-        await _write(vac, "region/set")
-        assert not lock.locked()
-
 
 class TestRead:
     async def test_returns_reply_without_judging_field_1(self) -> None:
@@ -263,62 +250,13 @@ class TestRead:
         vac = _vacuum()
         await _read(vac, "config/get", payload_hex="0a00", timeout=3)
         vac.coordinator.client.send_command.assert_awaited_once_with(
-            "config/get", bytes.fromhex("0a00"), timeout=3.0, hold_place_on_timeout=True
+            "config/get", bytes.fromhex("0a00"), timeout=3.0, hold_place_on_timeout=False
         )
 
     async def test_fires_no_event(self) -> None:
         vac = _vacuum()
         await _read(vac)
         vac.hass.bus.async_fire.assert_not_called()
-
-    @pytest.mark.parametrize("topic", ["map/get_map", "region/get", "config/get"])
-    async def test_known_read_does_not_take_the_action_lock(self, topic: str) -> None:
-        """A polled read on a sleeping robot must not delay stop or return."""
-        vac = _vacuum()
-        lock = vac.coordinator.dock_action_lock
-        await lock.acquire()
-        try:
-            response = await asyncio.wait_for(_read(vac, topic), 1)
-        finally:
-            lock.release()
-        assert response == {"response_hex": "0801", "response_bytes": 2}
-
-    @pytest.mark.parametrize(
-        "topic",
-        [
-            "config/set",
-            "region/set",
-            "common/reboot",
-            "consumable/reset_consumable_info",
-            "common/yell",
-            "developer/led_control",
-        ],
-    )
-    async def test_other_topic_takes_the_action_lock(self, topic: str) -> None:
-        """The read action cannot tell a read from a write, so it locks like one."""
-        vac = _vacuum()
-        lock = vac.coordinator.dock_action_lock
-
-        async def _send(*_args, **_kwargs):
-            assert lock.locked()
-            return CommandResponse(result_code=CommandResult.SUCCESS)
-
-        vac.coordinator.client.send_command = AsyncMock(side_effect=_send)
-        await _read(vac, topic)
-        vac.coordinator.client.send_command.assert_awaited_once()
-        assert not lock.locked()
-
-    async def test_wakes_without_the_action_lock(self) -> None:
-        vac = _vacuum()
-        lock = vac.coordinator.dock_action_lock
-        vac.coordinator.client.robot_awake = False
-
-        async def _wake(*_args, **_kwargs):
-            assert not lock.locked()
-
-        vac.coordinator.client.wake = AsyncMock(side_effect=_wake)
-        await _read(vac)
-        vac.coordinator.client.wake.assert_awaited_once()
 
     async def test_data_in_field_1_is_returned(self) -> None:
         vac = _vacuum(
@@ -395,10 +333,11 @@ class TestShared:
         vac.coordinator.client.send_command.assert_not_awaited()
 
     @pytest.mark.parametrize(
-        "topic", ["config/set", "region/set", "common/reboot", "config/gett"]
+        "topic",
+        ["config/set", "region/set", "common/reboot", "config/gett", "config/get", "region/get"],
     )
     async def test_other_topics_are_sent(self, action: str, topic: str) -> None:
-        """A topic not known to be answered gives up its place on a timeout."""
+        """A topic the client does not send itself gives up its place on a timeout."""
         vac = _vacuum()
         await _call(vac, action, topic)
         vac.coordinator.client.send_command.assert_awaited_once_with(
@@ -407,10 +346,10 @@ class TestShared:
 
     @pytest.mark.parametrize(
         "topic",
-        ["map/get_map", "config/get", "region/get", "common/yell", "developer/led_control"],
+        ["map/get_map", "common/get_device_info", "common/yell", "developer/led_control"],
     )
     async def test_answered_topics_keep_their_place(self, action: str, topic: str) -> None:
-        """A timeout on a topic known to be answered means a late reply, not none."""
+        """A timeout on a topic the client itself waits on means a late reply, not none."""
         vac = _vacuum()
         await _call(vac, action, topic)
         vac.coordinator.client.send_command.assert_awaited_once_with(
@@ -424,7 +363,7 @@ class TestShared:
         assert not answered & set(module._NATIVE_TOPICS)
         assert not answered & UNACKNOWLEDGED_TOPICS
         assert not answered & module._SESSION_TOPICS
-        for topic in answered - module._RAW_READ_TOPICS:
+        for topic in answered - module._RAW_READ_ALLOWED_TOPICS:
             assert not topic.startswith(module._NATIVE_TOPIC_PREFIXES)
 
     @pytest.mark.parametrize(
@@ -453,6 +392,66 @@ class TestShared:
         vac.coordinator.client.wake = AsyncMock()
         await _call(vac, action, "region/get")
         vac.coordinator.client.wake.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "topic",
+        [
+            "map/get_map",
+            "region/get",
+            "config/get",
+            "config/set",
+            "region/set",
+            "common/reboot",
+            "common/yell",
+        ],
+    )
+    async def test_holds_the_action_lock_while_sending(self, action: str, topic: str) -> None:
+        """The action cannot tell a read from a write, so every topic locks."""
+        vac = _vacuum()
+        lock = vac.coordinator.dock_action_lock
+
+        async def _send(*_args, **_kwargs):
+            assert lock.locked()
+            return CommandResponse(result_code=CommandResult.SUCCESS)
+
+        vac.coordinator.client.send_command = AsyncMock(side_effect=_send)
+        await asyncio.wait_for(_call(vac, action, topic), 1)
+        vac.coordinator.client.send_command.assert_awaited_once()
+        assert not lock.locked()
+
+    async def test_wakes_without_the_action_lock(self, action: str) -> None:
+        vac = _vacuum()
+        lock = vac.coordinator.dock_action_lock
+        vac.coordinator.client.robot_awake = False
+
+        async def _wake(*_args, **_kwargs):
+            assert not lock.locked()
+
+        vac.coordinator.client.wake = AsyncMock(side_effect=_wake)
+        await asyncio.wait_for(_call(vac, action, "config/set"), 1)
+        vac.coordinator.client.wake.assert_awaited_once()
+        vac.coordinator.client.send_command.assert_awaited_once()
+
+    async def test_wakes_before_waiting_for_the_action_lock(self, action: str) -> None:
+        """Stop or return holding the lock does not delay the wake, and vice versa."""
+        vac = _vacuum()
+        lock = vac.coordinator.dock_action_lock
+        client = vac.coordinator.client
+        client.robot_awake = False
+        client.wake = AsyncMock()
+        await lock.acquire()
+        task = asyncio.ensure_future(_call(vac, action, "config/set"))
+        try:
+            for _ in range(5):
+                await asyncio.sleep(0)
+            client.wake.assert_awaited_once()
+            client.send_command.assert_not_awaited()
+            assert not task.done()
+        finally:
+            lock.release()
+        await asyncio.wait_for(task, 1)
+        client.send_command.assert_awaited_once()
+        assert not lock.locked()
 
     @pytest.mark.parametrize(
         "topic",
@@ -514,9 +513,10 @@ class TestShared:
         vac.coordinator.client.robot_awake = False
         error = _vacuum_module(vac).NarwalConnectionError
         vac.coordinator.client.wake = AsyncMock(side_effect=error("gone"))
-        with pytest.raises(_HomeAssistantError):
+        with pytest.raises(_HomeAssistantError, match="gone"):
             await _call(vac, action, "region/get")
         vac.coordinator.client.send_command.assert_not_awaited()
+        assert not vac.coordinator.dock_action_lock.locked()
 
 
 def _client_const(module):
@@ -658,49 +658,25 @@ class TestTopicClassification:
         missing = sorted(name for name in names if getattr(const, name) not in allowed)
         assert not missing, missing
 
-    def test_read_topics_are_never_refused_and_never_act(self) -> None:
+    def test_answered_topics_are_exactly_the_awaited_client_topics(self) -> None:
+        """Fully set by the client source: every topic it awaits that is not native."""
         module = _vacuum_module(_vacuum())
         const = _client_const(module)
-        reads = module._RAW_READ_TOPICS
-        assert not reads & set(module._NATIVE_TOPICS)
-        assert not reads & module._SESSION_TOPICS
-        assert not reads & module.UNACKNOWLEDGED_TOPICS
-        assert const.TOPIC_CMD_YELL not in reads
-        assert const.TOPIC_CMD_SET_LED not in reads
-        # Pinned: adding a topic here asserts it has no side effects, because a
-        # known read is sent without the dock action lock.
-        assert reads == _KNOWN_READS
+        source = Path(const.__file__).with_name("client.py").read_text(encoding="utf-8")
+        names, unresolved = _awaited_topic_names(source)
+        assert not unresolved, unresolved
+        awaited = {getattr(const, name) for name in names}
+        assert awaited - set(module._NATIVE_TOPICS) == module._RAW_ANSWERED_TOPICS
 
-    def test_answered_topics_are_the_reads_plus_yell_and_led(self) -> None:
+    def test_read_allowed_topics_are_answered_clean_or_task_reads(self) -> None:
         module = _vacuum_module(_vacuum())
-        answered = module._RAW_ANSWERED_TOPICS
-        assert answered == module._RAW_READ_TOPICS | {"common/yell", "developer/led_control"}
+        allowed = module._RAW_READ_ALLOWED_TOPICS
+        assert allowed == {"clean/current_clean_task/get"}
+        assert allowed <= module._RAW_ANSWERED_TOPICS
+        assert not allowed & set(module._NATIVE_TOPICS)
+        assert not allowed & module._SESSION_TOPICS
+        assert not allowed & module.UNACKNOWLEDGED_TOPICS
 
-    def test_docs_list_exactly_the_known_reads(self) -> None:
-        doc = Path(__file__).parents[1] / "docs" / "SEND-COMMAND.md"
-        text = doc.read_text(encoding="utf-8")
-        heading = "- **Only known reads skip the action lock.**"
-        start = text.index(heading)
-        end = text.find("\n- ", start + len(heading))
-        bullet = text[start : end if end != -1 else None]
-        # Action names contain a dot, so only topics match.
-        listed = re.findall(r"`([a-z0-9_/]+)`", bullet)
-        assert sorted(listed) == sorted(_KNOWN_READS)
-
-
-_KNOWN_READS = {
-    "common/get_device_info",
-    "common/get_feature_list",
-    "status/get_device_base_status",
-    "consumable/get_consumable_info",
-    "clean/current_clean_task/get",
-    "map/get_map",
-    "map/get_all_reduced_maps",
-    "developer/take_picture",
-    "developer/get_robot_debug_image",
-    "config/get",
-    "region/get",
-}
 
 _SCAN_HEADER = "TOPIC_CMD_A = 'a'\n"
 

@@ -138,26 +138,18 @@ Freo 20, product key `fjhpiem4ba`, firmware v01.00.21.05:
   answers blocks other commands, polls included, until its timeout. Topics known never to be
   answered are refused up front, but a mistyped topic the robot ignores still causes this. That
   is why the timeout is capped at 10 s.
-- **A late reply.** A raw request to a topic known to be answered keeps its place after a
-  timeout, so a late reply is dropped. Those topics are the known reads listed under "Only
-  known reads skip the action lock" below, plus `common/yell` and `developer/led_control`. A
+- **A late reply.** A raw request to a topic the integration itself sends and waits on
+  (`map/get_map` and the like) keeps its place after a timeout, so a late reply is dropped. A
   request to any other topic gives up its place at once, so the next command's reply is not
   discarded. A reply to it that arrives after the timeout can be taken for the next command's
   answer, if one is in flight. A cancelled request (a restarted automation) gives up its place
   the same way.
-- **Writes make other actions wait.** `vacuum.send_command` holds the same lock as start, stop,
-  pause, return to dock, locate, `narwal.clean_rooms` and the dock tasks, so those wait until
-  it finishes: up to 10 s to wake the robot plus the timeout. `narwal.get_topic_response` takes
-  the same lock, except for the known reads below.
-- **Only known reads skip the action lock.** `narwal.get_topic_response` sends these topics
-  without that lock: `common/get_device_info`, `common/get_feature_list`,
-  `status/get_device_base_status`, `consumable/get_consumable_info`,
-  `clean/current_clean_task/get`, `map/get_map`, `map/get_all_reduced_maps`,
-  `developer/take_picture`, `developer/get_robot_debug_image`, `config/get` and `region/get`.
-  For any other topic it takes the same lock as `vacuum.send_command`, because it cannot tell
-  a read from a write. Every request still goes through the one-command-at-a-time queue, so
-  another command can wait up to a read's timeout. A known read only skips the wait for the
-  wake.
+- **Raw requests make other actions wait.** Each `vacuum.send_command` and
+  `narwal.get_topic_response` request holds the same lock as start, stop, pause, return to
+  dock, locate, `narwal.clean_rooms` and the dock tasks while it is sent and answered. Those
+  wait at most its timeout. The robot is woken before the lock is taken, so waking a sleeping
+  robot does not add to that wait. The lock is taken for every topic, because the action cannot
+  tell a read from a write.
 - **No undo.** Any user who can control the vacuum can send any topic that is not refused,
   including `common/reboot` and `common/shutdown`. Read a setting before changing it so you can put it
   back.
